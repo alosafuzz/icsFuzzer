@@ -725,7 +725,7 @@ the sidecar enabled.  Record the output and commit it to
 python3 scripts/<name>_responder.py --output output/
 
 # Terminal 2: fuzz it
-python3 icsFuzzer.py \
+python3 icsfuzzer.py \
     --protocol <name> \
     --target 127.0.0.1:<responder_port> \
     --yes

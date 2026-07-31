@@ -56,14 +56,14 @@ Calibrate against a software responder before any live target:
 python3 scripts/modbus_responder.py --output output/
 
 # terminal 2 — fuzz the responder
-python3 icsFuzzer.py --protocol modbus --target 127.0.0.1:5020 --yes
+python3 icsfuzzer.py --protocol modbus --target 127.0.0.1:5020 --yes
 ```
 
 Then point it at an authorized target:
 
 ```bash
-python3 icsFuzzer.py --protocol s7comm --target 192.168.1.10:102 --yes
-python3 icsFuzzer.py --protocol modbus  --target 192.168.1.10:502 --delay 0.1
+python3 icsfuzzer.py --protocol s7comm --target 192.168.1.10:102 --yes
+python3 icsfuzzer.py --protocol modbus  --target 192.168.1.10:502 --delay 0.1
 ```
 
 Useful flags: `--categories a,b,c` (run a subset), `--dry-run` (generate cases without

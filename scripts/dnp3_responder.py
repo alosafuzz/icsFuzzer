@@ -35,7 +35,7 @@ Usage:
   python3 scripts/dnp3_responder.py [--host 127.0.0.1] [--port 20001]
 
   Then run the fuzzer against it:
-  python3 icsFuzzer.py --protocol dnp3 --target 127.0.0.1:20001 --yes
+  python3 icsfuzzer.py --protocol dnp3 --target 127.0.0.1:20001 --yes
 """
 
 import argparse

@@ -81,6 +81,6 @@ class FuzzReporter:
                     f"  {r['id']:<20} {r.get('protocol','?'):<12} "
                     f"{r.get('category','?'):<20} {r.get('description','?')[:50]}"
                 )
-            print(f"\n  Replay a case: python icsFuzzer.py --replay <ID>")
+            print(f"\n  Replay a case: python icsfuzzer.py --replay <ID>")
 
         print("=" * 60 + "\n")

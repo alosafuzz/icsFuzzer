@@ -38,7 +38,7 @@ Usage:
   python3 scripts/iec104_responder.py [--host 127.0.0.1] [--port 2405]
 
   Then run the fuzzer against it:
-  python3 icsFuzzer.py --protocol iec104 --target 127.0.0.1:2405 --yes
+  python3 icsfuzzer.py --protocol iec104 --target 127.0.0.1:2405 --yes
 """
 
 import argparse

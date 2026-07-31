@@ -67,4 +67,4 @@ pip install --quiet pyiec61850-ng || echo "  [warn] pyiec61850-ng not installed.
 
 echo ""
 echo "[setup] Done. Activate venv with: source venv/bin/activate"
-echo "[setup] Then run: python icsFuzzer.py --list-protocols"
+echo "[setup] Then run: python icsfuzzer.py --list-protocols"

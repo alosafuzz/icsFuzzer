@@ -43,7 +43,7 @@ Usage:
   python3 scripts/modbus_responder.py [--host 127.0.0.1] [--port 5020] [--output output/]
 
   Then run the fuzzer against it:
-  python3 icsFuzzer.py --protocol modbus --target 127.0.0.1:5020 --yes
+  python3 icsfuzzer.py --protocol modbus --target 127.0.0.1:5020 --yes
 """
 
 import argparse
