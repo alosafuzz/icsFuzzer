@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Fuzzer output
+output/
+*.jsonl
+
+# Packet captures
+*.pcap
+*.pcapng
+*.cap
+
+# Keys / certs
+*.pem
+*.key
+*.crt
+*.p12
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

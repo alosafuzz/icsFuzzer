@@ -1,0 +1,19 @@
+# icsFuzzer dependencies
+# Run: pip install -r requirements.txt
+# For C++ extension modules (pydnp3, c104, pyiec61850-ng), run: bash setup.sh
+
+# Core
+scapy>=2.5.0
+networkx>=3.0
+pyvis>=0.3.2
+
+# Phase 2 protocols
+pymodbus>=3.6.0
+asyncua>=1.0.0
+
+# Phase 3 protocols (install via setup.sh where C++ build is needed)
+# pycomm3>=1.2.0        # EtherNet/IP — pure Python, install directly
+# bacpypes3>=0.0.80     # BACnet — pure Python, install directly
+# pydnp3>=0.1.0         # DNP3 — requires OpenDNP3 C++ build, see setup.sh
+# c104>=2.0.0           # IEC 60870-5-104 — requires C++ build, see setup.sh
+# pyiec61850-ng>=1.6.0  # IEC 61850 — requires libiec61850 C build, see setup.sh

