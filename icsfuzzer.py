@@ -429,6 +429,17 @@ examples:
             "environments where even a single extra packet is unacceptable."
         ),
     )
+    parser.add_argument(
+        "--enable-dangerous",
+        action="store_true",
+        help=(
+            "Enable protocol modules' dangerous_services category (e.g. GE SRTP: "
+            "SET_PLC_RUN stop/start, WRITE_SYS_MEM, TOGGLE_FORCE_SYS_MEM). Sends requests "
+            "that can halt, reprogram, or force I/O on a live PLC. Off by default; also "
+            "requires --categories to include dangerous_services. Use only against a "
+            "target you are authorized to disrupt."
+        ),
+    )
 
     return parser
 
@@ -721,6 +732,8 @@ def main():
                 _kwargs["injection_file"] = args.injection_file
             if "unit_id" in _sig.parameters and getattr(args, "unit_id", None) is not None:
                 _kwargs["unit_id"] = args.unit_id
+            if "dangerous" in _sig.parameters and getattr(args, "enable_dangerous", False):
+                _kwargs["dangerous"] = True
             fuzzer = FuzzerClass(**_kwargs)
 
             try:

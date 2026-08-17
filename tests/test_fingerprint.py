@@ -1,6 +1,8 @@
 """Unit tests for core/fingerprint.py — all offline, no network I/O."""
 
+import socket
 import struct
+import threading
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -391,3 +393,180 @@ class TestFuzzModuleFingerprint:
             r = fuzzer.fingerprint(active=False)
         assert r.confidence in ("low", "medium", "high")
         assert "Rockwell" in r.vendor
+
+
+# ── BacnetFuzzer.fingerprint(active=True) end-to-end ──────────────────────────
+#
+# Regression coverage for the bugs found porting this code to icsScanner
+# (lab-notes/fingerprint-bugs-found-via-icsscanner-port.md, bugs 2 & 3):
+# invoke-id checked at the wrong response offset, and the character-string
+# extractor could never skip past a real ReadProperty-ACK's context-tag-3
+# wrapper. Deliberately uses realistic (non-trivially-short) vendor/model
+# strings — exactly what the icsScanner port used to catch these.
+
+def _free_udp_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _correct_app_char_string(s: str) -> bytes:
+    """Spec-correct application-tagged character string (tag 0x75, one length
+    byte, encoding byte, then the UTF-8 bytes), matching the fixed
+    protocols.bacnet.fuzzer._app_char_string() exactly for this length tier.
+    Written independently (not calling that function) so this test doesn't
+    depend on the helper it's indirectly exercising — this class of bug (a
+    stray extra 0x05 byte before the length field, previously present for
+    any string >4 bytes long) is exactly the kind an encoder and its own
+    round-trip test can both get wrong the same way if they share code.
+    """
+    enc = s.encode("utf-8")
+    total = 1 + len(enc)
+    return bytes([0x75, total, 0x00]) + enc
+
+
+def _bacnet_active_fp_server(srv: socket.socket, stop: threading.Event,
+                              vendor: str, model: str, firmware: str) -> None:
+    from protocols.bacnet.fuzzer import (
+        _i_am, _bacnet_pkt, _ctx_tag, _ctx_open, _ctx_close,
+        _obj_id_bytes, _prop_ctx_tag,
+        _OBJ_DEVICE, _PROP_VENDOR_NAME, _PROP_MODEL_NAME,
+        _PROP_FIRMWARE_REVISION, _SVC_READ_PROPERTY,
+    )
+    values = {
+        _PROP_VENDOR_NAME & 0xFF: vendor,
+        _PROP_MODEL_NAME & 0xFF: model,
+        _PROP_FIRMWARE_REVISION & 0xFF: firmware,
+    }
+    while not stop.is_set():
+        try:
+            data, addr = srv.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if len(data) < 8:
+            continue
+        apdu = data[6:]
+        pdu_type = apdu[0] & 0xF0
+        if pdu_type == 0x10:
+            # Unconfirmed-Request (Who-Is) -> I-Am
+            srv.sendto(_i_am(), addr)
+        elif pdu_type == 0x00 and len(apdu) >= 3:
+            # Confirmed-Request (ReadProperty) -> Complex-ACK, real context-tag-3
+            # wrapped character string, matching a genuine device's response shape.
+            invoke_id = apdu[2]
+            value = values.get(invoke_id)
+            if value is None:
+                continue
+            body = (_ctx_tag(0, _obj_id_bytes(_OBJ_DEVICE, 1234))
+                    + _prop_ctx_tag(1, invoke_id)
+                    + _ctx_open(3) + _correct_app_char_string(value) + _ctx_close(3))
+            resp_apdu = bytes([0x30, invoke_id, _SVC_READ_PROPERTY]) + body
+            srv.sendto(_bacnet_pkt(0x00, resp_apdu), addr)
+
+
+class TestBacnetFingerprintActive:
+    def test_active_fingerprint_reads_realistic_length_strings(self):
+        from protocols.bacnet.fuzzer import BacnetFuzzer
+
+        port = _free_udp_port()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.bind(("127.0.0.1", port))
+        srv.settimeout(0.2)
+        stop = threading.Event()
+        t = threading.Thread(
+            target=_bacnet_active_fp_server,
+            args=(srv, stop, "Fabrikam Controls", "FC-900 RTU", "v3.14.159"),
+            daemon=True,
+        )
+        t.start()
+        try:
+            dev = Device("127.0.0.1", port, "bacnet")
+            fuzzer = BacnetFuzzer(target=dev, logger=None, delay=0)
+            with patch("core.fingerprint.get_mac_from_arp", return_value=None):
+                result = fuzzer.fingerprint(active=True)
+        finally:
+            stop.set()
+            t.join(timeout=2)
+            srv.close()
+
+        assert result.vendor == "Fabrikam Controls"
+        assert result.model == "FC-900 RTU"
+        assert result.firmware == "v3.14.159"
+        assert result.confidence == "high"
+
+
+# ── Dnp3Fuzzer.fingerprint(active=True) end-to-end ─────────────────────────────
+#
+# Regression coverage for bugs 1 & 4 in the same icsScanner-port note: the
+# outgoing request was missing its Transport-Layer byte, and the string
+# extractor didn't strip inter-block CRCs. The server below only recognizes a
+# request as READ if the TL byte correctly shifted the AC/FC bytes into place
+# (catches bug 1 if reintroduced), and both response strings are long enough
+# to cross a 16-byte DNP3 block boundary (catches bug 4 if reintroduced).
+
+def _dnp3_active_fp_conn(conn: socket.socket, values: dict) -> None:
+    from protocols.dnp3.fuzzer import (
+        _recv_dnp3, _dnp3_strip_block_crcs, _FC_READ, _FC_RESPONSE,
+        _tl_byte, _app_request, _dll_frame,
+    )
+    while True:
+        req = _recv_dnp3(conn, timeout=2.0)
+        if not req:
+            break
+        user_data = _dnp3_strip_block_crcs(req)
+        if len(user_data) < 6:
+            continue
+        # user_data = [TL][AC][FC][group][var][qualifier]... — if the TL byte
+        # were missing (bug 1), this FC check would see the group byte (0x00)
+        # instead of _FC_READ and correctly refuse to answer.
+        if user_data[2] != _FC_READ:
+            continue
+        group, var = user_data[3], user_data[4]
+        value = values.get((group, var))
+        if value is None:
+            continue
+        raw = value.encode("ascii")
+        obj_body = bytes([group, var, 0x06, 0x00, len(raw)]) + raw
+        resp_al = _app_request(_FC_RESPONSE, obj_body, seq=0)
+        conn.sendall(_dll_frame(_tl_byte(seq=0) + resp_al))
+
+
+class TestDnp3FingerprintActive:
+    def test_active_fingerprint_reads_strings_crossing_block_boundary(self):
+        from protocols.dnp3.fuzzer import Dnp3Fuzzer
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(4)
+        stop = threading.Event()
+        vendor, model = "Fabrikam Controls", "FC-900 RTU Model 2000"
+
+        def _serve():
+            srv.settimeout(0.5)
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                _dnp3_active_fp_conn(conn, {(0x00, 0xF3): vendor, (0x00, 0xF5): model})
+                conn.close()
+
+        t = threading.Thread(target=_serve, daemon=True)
+        t.start()
+        try:
+            dev = Device("127.0.0.1", port, "dnp3")
+            fuzzer = Dnp3Fuzzer(target=dev, logger=None, delay=0)
+            with patch("core.fingerprint.get_mac_from_arp", return_value=None):
+                result = fuzzer.fingerprint(active=True)
+        finally:
+            stop.set()
+            srv.close()
+            t.join(timeout=2)
+
+        assert result.vendor == vendor
+        assert result.model == model
+        assert len(vendor) + 8 > 16   # sanity: vendor response really crosses a block boundary
+        assert len(model) + 8 > 16

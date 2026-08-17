@@ -189,16 +189,26 @@ def _app_obj_id(obj_type: int, instance: int) -> bytes:
 
 
 def _app_char_string(s: str) -> bytes:
-    """Application-tagged Character String (UTF-8 encoding=0x00)."""
+    """Application-tagged Character String (UTF-8 encoding=0x00).
+
+    Tag byte 0x75 = application tag 7 (character string), lvt=5 ("extended
+    length follows"). The extended-length form is always one marker/length
+    field immediately after the tag byte — total<254: the length itself;
+    254<=total<65536: marker byte 254 + 2-byte length; total>=65536: marker
+    byte 255 + 4-byte length. Do NOT insert a literal 0x05 byte before that
+    field — 0x05 is already encoded in the tag byte's own low nibble, and a
+    second copy shifts every following byte, corrupting the value (found via
+    icsScanner port, see lab-notes/fingerprint-bugs-found-via-icsscanner-port.md).
+    """
     enc   = s.encode('utf-8')
     total = 1 + len(enc)          # encoding indicator byte + string bytes
     if total <= 4:
         return bytes([0x75, total, 0x00]) + enc
     if total < 254:
-        return bytes([0x75, 0x05, total, 0x00]) + enc
+        return bytes([0x75, total, 0x00]) + enc
     if total < 65536:
-        return bytes([0x75, 0x05, 254]) + struct.pack('>H', total) + bytes([0x00]) + enc
-    return bytes([0x75, 0x05, 255]) + struct.pack('>I', total) + bytes([0x00]) + enc
+        return bytes([0x75, 254]) + struct.pack('>H', total) + bytes([0x00]) + enc
+    return bytes([0x75, 255]) + struct.pack('>I', total) + bytes([0x00]) + enc
 
 
 def _obj_id_bytes(obj_type: int, instance: int) -> bytes:
@@ -396,6 +406,8 @@ def _extract_bacnet_string(frame: bytes) -> Optional[str]:
             elif lvt == 5 and pos < len(data):
                 ext_len = data[pos]
                 pos += 1 + ext_len
+            elif lvt in (6, 7):
+                pass  # opening/closing context tag — already consumed, nothing more to skip
             else:
                 break
     return None
@@ -519,9 +531,10 @@ class BacnetFuzzer(FuzzModule):
                 s.sendto(pkt, target_addr)
                 try:
                     resp, _ = s.recvfrom(1024)
-                    # Confirmed-ACK: PDU type at resp[9], invoke_id at resp[10].
+                    # Confirmed-ACK: BVLL(4)+NPDU(2)+APDU[pdu-type(1),invoke-id(1),...] —
+                    # invoke_id is the APDU's second byte, overall offset 7.
                     # Discard stale UDP responses whose invoke_id doesn't match.
-                    if len(resp) <= 10 or resp[10] != expected_iid:
+                    if len(resp) <= 7 or resp[7] != expected_iid:
                         continue
                     txt = _extract_bacnet_string(resp)
                     if txt:

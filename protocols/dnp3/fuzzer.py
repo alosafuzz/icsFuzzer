@@ -224,6 +224,29 @@ def _recv_dnp3(sock: "socket.socket", timeout: float = 3.0) -> Optional[bytes]:
     return buf
 
 
+def _dnp3_strip_block_crcs(frame: bytes) -> bytes:
+    """Reconstruct a DNP3 frame's user_data with the per-16-byte-block CRCs removed.
+
+    user_data is transmitted in 16-byte blocks, each followed by its own 2-byte
+    CRC. Scanning the raw framed bytes directly (as if user_data were
+    contiguous) silently splices CRC bytes into any value that crosses a block
+    boundary.
+    """
+    if len(frame) < 10:
+        return b""
+    dll_len = frame[2]
+    user_data_len = max(0, dll_len - 5)
+    pos = 10
+    out = bytearray()
+    remaining = user_data_len
+    while remaining > 0 and pos < len(frame):
+        chunk_len = min(16, remaining)
+        out += frame[pos : pos + chunk_len]
+        pos += chunk_len + 2  # skip this block's 2-byte CRC
+        remaining -= chunk_len
+    return bytes(out)
+
+
 def _extract_dnp3_string(frame: bytes, group: int, variation: int) -> Optional[str]:
     """Extract an ASCII string from a DNP3 Device Attribute response frame.
 
@@ -233,9 +256,11 @@ def _extract_dnp3_string(frame: bytes, group: int, variation: int) -> Optional[s
     """
     if not frame or len(frame) < 12:
         return None
-    # Skip DLL header (10 bytes) + TL byte (1) + AC byte (1) + FC byte (1) = 13
-    # Then scan for our group/variation and extract the string value
-    data = frame[13:]
+    # De-block first (user_data's 16-byte blocks each carry their own 2-byte
+    # CRC that must not be scanned as data), then skip TL byte (1) + AC byte
+    # (1) + FC byte (1) = 3 — _dnp3_strip_block_crcs already starts past the
+    # 10-byte DLL header, so no separate DLL skip is needed here.
+    data = _dnp3_strip_block_crcs(frame)[3:]
     # Look for the group/variation header: group(1) var(1) qualifier(1) count(1) then value
     i = 0
     while i < len(data) - 4:
@@ -330,7 +355,7 @@ class Dnp3Fuzzer(FuzzModule):
             s.connect((self.target.ip, self.target.port))
             # Read Group 0 Var 243 (Vendor Name)
             al_vendor = _app_request(_FC_READ, bytes([0x00, 0xF3, 0x06]), seq=1)
-            s.sendall(_dll_frame(al_vendor))
+            s.sendall(_dll_frame(_tl_byte(seq=1) + al_vendor))
             resp = _recv_dnp3(s)
             if resp:
                 txt = _extract_dnp3_string(resp, 0x00, 0xF3)
@@ -338,7 +363,7 @@ class Dnp3Fuzzer(FuzzModule):
                     vendor = txt
             # Read Group 0 Var 245 (Device Model)
             al_model = _app_request(_FC_READ, bytes([0x00, 0xF5, 0x06]), seq=2)
-            s.sendall(_dll_frame(al_model))
+            s.sendall(_dll_frame(_tl_byte(seq=2) + al_model))
             resp2 = _recv_dnp3(s)
             if resp2:
                 txt2 = _extract_dnp3_string(resp2, 0x00, 0xF5)
