@@ -1,72 +1,108 @@
 #!/usr/bin/env python3
 """Extract a deduplicated, per-protocol fuzzing-seed corpus from the PNNL ICS network-capture
-dataset (DOI 10.25584/PNNLDH/1838670 — DNP3/Modbus captures against SAGE RTU, SEL 451, ROC 800,
-FloBoss across ~14 labeled scenarios). Added 2026-11-05.
+dataset (DOI 10.25584/PNNLDH/1838670 — DNP3/Modbus captures against SAGE RTU, SEL 451/351, GE
+L90/D30, ControlWave IO, across ~14 labeled scenarios). Added 2026-11-05; reworked to use tshark
+after scapy's rdpcap/PcapReader proved too slow and memory-heavy on this set's multi-GB
+long-duration captures.
 
 icsFuzzer already ingests a single pcap as in-memory seeds (`icsfuzzer.py --pcap`, core/capture.py).
-This tool is the batch/corpus complement: point it at a directory of the PNNL pcaps and it writes the
-unique application-layer payloads to disk, one file per seed, grouped by protocol — a reusable corpus
-the structured fuzzers can draw from (the DNP3/Modbus modules' `seeds=` argument), and which the
-malformed/bad-CRC/fuzzing-labeled scenarios especially enrich.
+This tool is the batch/corpus complement: point it at a directory of captures and it writes the
+unique application-layer payloads to disk, one file per seed, grouped by protocol — a reusable
+corpus the structured fuzzers can draw from (the DNP3/Modbus modules' `seeds=` argument).
 
-Usage (from the ics-fuzzer repo root):
+WHY tshark, not scapy: tshark (C) streams a capture and emits only the fields we need at low, bounded
+memory and high speed; scapy dissects every packet in Python and, via rdpcap, loads whole files into
+RAM. This tool holds only the dedup index (one small record per UNIQUE seed) in memory — payload
+bytes are written to disk on first sight and never retained — and flushes the manifest after every
+capture, so a mid-run interruption still leaves a usable partial corpus.
+
+Usage (from the ics-fuzzer repo root; requires tshark on PATH):
     python3 scripts/pnnl_corpus_extract.py <pcap-dir-or-file> [more...] \
-        [--out output/pnnl-corpus] [--protocols dnp3,modbus]
+        [--out output/pnnl-corpus] [--protocols dnp3,modbus] [--progress]
 
 Output:
-    <out>/<proto>/<sha16>.bin        one unique app-layer payload per file
-    <out>/manifest.json              seed -> {proto, len, sources:[{pcap, scenario, src, dst}]}
+    <out>/<proto>/<sha16>.bin    one unique app-layer payload per file
+    <out>/manifest.json          seed -> {sha256, proto, len, sources:[{pcap, scenario, src, dst}]}
 
-SAFE: read-only. It only reads pcap files and writes seed files; it sends nothing on the network.
-Downloaded captures are untrusted data — run this against a copy in its own directory.
+SAFE: read-only. It only reads pcap files (via tshark) and writes seed files; it sends nothing on the
+network. Downloaded captures are untrusted data — run against a copy in its own directory.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
-# Application-layer seeds are keyed by transport port. Kept local (not imported from icsfuzzer.py's
-# PROTOCOL_PORTS) so this tool stays standalone; values match that table.
+# Application-layer seeds are keyed by transport port; values match icsfuzzer.py's PROTOCOL_PORTS.
 PROTOCOL_PORTS = {"dnp3": 20000, "modbus": 502}
+
+# tshark field order (pipe-separated; payloads render as plain hex, so '|' never collides).
+_FIELDS = ["ip.src", "ip.dst", "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport",
+           "tcp.payload", "udp.payload"]
+_SEP = "|"
 
 
 def _scenario_from_path(pcap_path: Path) -> str:
-    """A short scenario label derived from the capture's filename (the PNNL set names its 14
-    scenarios in the filenames, e.g. 'normal', 'malformed', 'arp_spoof', ...)."""
+    """Short scenario label from the filename (the PNNL set encodes its scenarios there)."""
     return pcap_path.stem.lower()
 
 
-def extract_from_packets(packets, portmap=PROTOCOL_PORTS):
-    """Pure extraction: given an iterable of scapy packets, return
-    {proto: [ {payload: bytes, src: str, dst: str} , ... ]} for every TCP/UDP packet carrying a
-    non-empty application-layer payload on a matched port. No dedup here (the caller dedups across
-    files) — this keeps the function straightforward to unit-test against hand-built packets."""
-    from scapy.layers.inet import TCP, UDP, IP  # local import so --help works without scapy
+def build_filter(protocols) -> str:
+    """A tshark display filter selecting non-empty app-layer payloads on the protocols' ports."""
+    clauses = []
+    for proto in protocols:
+        port = PROTOCOL_PORTS[proto]
+        clauses.append(f"(tcp.port=={port} && tcp.len>0)")
+        clauses.append(f"(udp.port=={port} && udp.length>8)")
+    return " || ".join(clauses)
 
-    out = {proto: [] for proto in portmap}
-    port_to_proto = {port: proto for proto, port in portmap.items()}
-    for pkt in packets:
-        l4 = pkt.getlayer(TCP) or pkt.getlayer(UDP)
-        if l4 is None:
-            continue
-        proto = port_to_proto.get(l4.dport) or port_to_proto.get(l4.sport)
-        if proto is None:
-            continue
-        payload = bytes(l4.payload)
-        if not payload:
-            continue
-        ip = pkt.getlayer(IP)
-        src = ip.src if ip else "?"
-        dst = ip.dst if ip else "?"
-        out[proto].append({"payload": payload, "src": src, "dst": dst})
-    return out
+
+def tshark_cmd(pcap: Path, display_filter: str) -> list:
+    """The exact tshark argv used per capture (factored out so tests can assert its shape)."""
+    cmd = ["tshark", "-r", str(pcap), "-Y", display_filter, "-T", "fields"]
+    for f in _FIELDS:
+        cmd += ["-e", f]
+    cmd += ["-E", f"separator={_SEP}", "-E", "occurrence=f"]
+    return cmd
+
+
+def parse_tshark_line(line: str, port_to_proto) -> "tuple | None":
+    """Parse one pipe-separated tshark row into (proto, payload_bytes, src, dst), or None if it has
+    no usable app-layer payload / matches no protocol. Pure — unit-testable with synthetic rows."""
+    parts = line.rstrip("\n").split(_SEP)
+    if len(parts) != len(_FIELDS):
+        return None
+    ip_src, ip_dst, tsp, tdp, usp, udp_p, tcp_pl, udp_pl = parts
+    if tcp_pl:
+        payload_hex, sport, dport = tcp_pl, tsp, tdp
+    elif udp_pl:
+        payload_hex, sport, dport = udp_pl, usp, udp_p
+    else:
+        return None
+    proto = None
+    for p in (dport, sport):
+        try:
+            proto = port_to_proto.get(int(p))
+        except (TypeError, ValueError):
+            proto = None
+        if proto:
+            break
+    if proto is None:
+        return None
+    try:
+        payload = bytes.fromhex(payload_hex)
+    except ValueError:
+        return None
+    if not payload:
+        return None
+    return proto, payload, ip_src or "?", ip_dst or "?"
 
 
 def iter_pcaps(paths):
-    """Yield every .pcap/.pcapng under the given files/dirs."""
     for p in paths:
         p = Path(p)
         if p.is_dir():
@@ -75,54 +111,60 @@ def iter_pcaps(paths):
             yield p
 
 
-def build_corpus(paths, protocols):
-    """Walk every pcap, extract per-protocol payloads, dedup by sha256. Returns
-    (corpus, stats) where corpus[proto][sha] = {payload, len, sources:[...]}."""
-    from scapy.all import rdpcap
+def build_corpus(paths, protocols, out_dir: Path, progress=False):
+    """Stream every capture through tshark, dedup app-layer payloads by sha256, and write each unique
+    seed to disk on first sight (payload bytes are NOT kept in memory). The manifest is rewritten
+    after every capture so an interruption still leaves a usable corpus. Returns (manifest, stats)."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    port_to_proto = {PROTOCOL_PORTS[p]: p for p in protocols}
+    display_filter = build_filter(protocols)
+    for proto in protocols:
+        (out_dir / proto).mkdir(parents=True, exist_ok=True)
 
-    portmap = {p: PROTOCOL_PORTS[p] for p in protocols}
-    corpus = {proto: {} for proto in portmap}
-    stats = {proto: {"packets": 0, "unique": 0} for proto in portmap}
+    manifest = {}                      # "proto/sha16.bin" -> {sha256, proto, len, sources:[...]}
+    seen = {}                          # sha256 -> manifest key (so dups just append a source)
+    stats = {proto: {"packets": 0, "unique": 0} for proto in protocols}
     files_seen = 0
+
     for pcap in iter_pcaps(paths):
         files_seen += 1
         scenario = _scenario_from_path(pcap)
+        if progress:
+            print(f"[.] {pcap.name}", file=sys.stderr, flush=True)
+        proc = subprocess.Popen(tshark_cmd(pcap, display_filter), stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
         try:
-            packets = rdpcap(str(pcap))
-        except Exception as e:  # a corrupt/odd capture must not abort the whole batch
-            print(f"[warn] could not read {pcap}: {e}", file=sys.stderr)
-            continue
-        per = extract_from_packets(packets, portmap)
-        for proto, items in per.items():
-            for it in items:
+            for line in proc.stdout:
+                m = parse_tshark_line(line, port_to_proto)
+                if m is None:
+                    continue
+                proto, payload, src, dst = m
                 stats[proto]["packets"] += 1
-                sha = hashlib.sha256(it["payload"]).hexdigest()
-                entry = corpus[proto].get(sha)
-                src_rec = {"pcap": pcap.name, "scenario": scenario, "src": it["src"], "dst": it["dst"]}
-                if entry is None:
-                    corpus[proto][sha] = {"payload": it["payload"], "len": len(it["payload"]), "sources": [src_rec]}
-                elif src_rec not in entry["sources"]:
-                    entry["sources"].append(src_rec)
-    for proto in corpus:
-        stats[proto]["unique"] = len(corpus[proto])
+                sha = hashlib.sha256(payload).hexdigest()
+                src_rec = {"pcap": pcap.name, "scenario": scenario, "src": src, "dst": dst}
+                if sha not in seen:
+                    key = f"{proto}/{sha[:16]}.bin"
+                    (out_dir / key).write_bytes(payload)   # flush seed immediately
+                    manifest[key] = {"sha256": sha, "proto": proto, "len": len(payload), "sources": [src_rec]}
+                    seen[sha] = key
+                else:
+                    entry = manifest[seen[sha]]
+                    if src_rec not in entry["sources"]:
+                        entry["sources"].append(src_rec)
+        finally:
+            proc.stdout.close()
+            proc.wait()
+        _write_manifest(out_dir, manifest)   # kill-safe: current after every capture
+
+    for proto in protocols:
+        stats[proto]["unique"] = sum(1 for e in manifest.values() if e["proto"] == proto)
     stats["_files"] = files_seen
-    return corpus, stats
+    return manifest, stats
 
 
-def write_corpus(corpus, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {}
-    for proto, seeds in corpus.items():
-        pdir = out_dir / proto
-        pdir.mkdir(parents=True, exist_ok=True)
-        for sha, entry in seeds.items():
-            short = sha[:16]
-            (pdir / f"{short}.bin").write_bytes(entry["payload"])
-            manifest[f"{proto}/{short}.bin"] = {
-                "sha256": sha, "proto": proto, "len": entry["len"], "sources": entry["sources"],
-            }
+def _write_manifest(out_dir: Path, manifest: dict):
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return manifest
 
 
 def main():
@@ -130,20 +172,23 @@ def main():
     ap.add_argument("paths", nargs="+", help="pcap files or directories (recursed)")
     ap.add_argument("--out", default="output/pnnl-corpus", help="corpus output directory")
     ap.add_argument("--protocols", default="dnp3,modbus", help="comma-separated (default dnp3,modbus)")
+    ap.add_argument("--progress", action="store_true", help="print each capture name as it streams")
     args = ap.parse_args()
+
+    if shutil.which("tshark") is None:
+        ap.error("tshark is required (install Wireshark/tshark and ensure it is on PATH)")
 
     protocols = [p.strip() for p in args.protocols.split(",") if p.strip()]
     unknown = [p for p in protocols if p not in PROTOCOL_PORTS]
     if unknown:
         ap.error(f"unknown protocol(s) {unknown}; known: {sorted(PROTOCOL_PORTS)}")
 
-    corpus, stats = build_corpus(args.paths, protocols)
     out_dir = Path(args.out)
-    write_corpus(corpus, out_dir)
+    manifest, stats = build_corpus(args.paths, protocols, out_dir, progress=args.progress)
 
-    print(f"Read {stats['_files']} pcap file(s). Corpus -> {out_dir}")
+    print(f"Read {stats['_files']} capture(s). Corpus -> {out_dir}")
     for proto in protocols:
-        print(f"  {proto:8} {stats[proto]['packets']:6d} payload packets -> {stats[proto]['unique']:5d} unique seeds")
+        print(f"  {proto:8} {stats[proto]['packets']:7d} payload packets -> {stats[proto]['unique']:6d} unique seeds")
     print(f"  manifest: {out_dir / 'manifest.json'}")
 
 
